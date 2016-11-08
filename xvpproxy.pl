@@ -54,6 +54,12 @@ helper create_table => sub {
   $c->db->do('CREATE TABLE pools (name TEXT NOT NULL UNIQUE, ip TEXT NOT NULL);');
 };
 
+helper delete_table => sub {
+  my $c = shift;
+  $c->app->log->info("Deleting table 'pool'");
+  $c->db->do('DELETE FROM pools');
+};
+
 helper select => sub {
   my $c = shift;
   my $sth = eval { $c->db->prepare('SELECT * FROM pools') } || return undef;
@@ -81,9 +87,15 @@ websocket '/fetch' => sub {
       my ($ua, $tx) = @_;
       my %tmphash = ();
       my $body = $tx->res->body;
+      if ($tx->error) {
+        my $error = $tx->error->{message}." while fetching dom0s from nagios.";
+        $c->app->log->error($error);
+        $ws->send({ json => $error });
+      }
       $tmphash{$1} = $2 while $body =~ /check_xen!([^!]+)!([^!]+)!HOSTS/sgi;
+      $c->delete_table;
       map{ $c->insert($_, $tmphash{$_}) } keys %tmphash;
-      $ws->send({ json => 'Got '.(scalar keys %tmphash).' pools from nagios.' });
+      $ws->send({ json => 'Got '.(scalar keys %tmphash)." pools from nagios: ".join(", ", keys %tmphash) });
     });
   });
 };
@@ -92,7 +104,6 @@ websocket '/fetch' => sub {
 websocket '/*target' => sub {
   my $c = shift;
   $c->render_later;
-  $c->inactivity_timeout(300);
   $c->on(finish => sub { warn 'websocket closing' });
   $c->tx->with_protocols('binary');
   my $tx = $c->tx;
@@ -112,6 +123,10 @@ websocket '/*target' => sub {
     sub {
       my ($delay, @results) = @_;
       foreach my $res (@results) {
+        if ($res->error) {
+          $c->app->log->error("Skipping '$res->{args}->{hostname}' due to ".$res->error->{message}."'");
+          next;
+        }
         my $token = $res->res->dom->find('member value')->last->text;
         $c->app->log->info("[2] Got token '$token from ".$res->original_remote_address);
         $delay->data->{$res->original_remote_address}->{token} =  $token;
@@ -166,7 +181,7 @@ websocket '/*target' => sub {
 
           $tcp->on(error => sub { $tx->finish(4500, "TCP error: $_[1]") });
 
-          # This method will only trigger once so we can deal with the RVP response.
+          # This method will only trigger once so we can deal with the XVP response.
           $tcp->once(read => sub {
             my ($tcp, $bytes) = @_;
             my $length = length($bytes);
@@ -176,8 +191,10 @@ websocket '/*target' => sub {
             # Workaround for getting the ProtocolVersion Handshake with the response.
             # The standard reply is 78 bytes long, the Handshake is 12.
             $tx->send({binary => substr($bytes, -12)}) if $length == 90;
+            $tx->send({text => "\r\n"}) if $length == 76;
+            $c->inactivity_timeout(300);
             $tcp->timeout(300);
-            # Suscribe to the read event for the RFB stream.
+            # Subscribe to the read event for the RFB stream.
             $tcp->on(read => sub {
               my ($tcp, $bytes) = @_;
               $tx->send({binary => $bytes});
@@ -242,7 +259,7 @@ __DATA__
     <div id="overlay">
       <div class="ui mini right labeled input">
         <a id="fetch" class="ui black label">Fetch</a>
-        <input id="choose" placeholder="Enter a Xen VM name..." type="text">
+        <input id="choose" placeholder="Enter a Xen VM name..." type="text" autocomplete="off">
         <a id="connect" class="ui black tag label">Connect</a>
       </div>
     </div>
@@ -250,6 +267,21 @@ __DATA__
   </div>
   %= javascript 'https://ajax.googleapis.com/ajax/libs/jquery/1.12.4/jquery.min.js'
   %= javascript begin
+    %# Don't know if that's actually usefull
+    $('#vnc').focus();
+    %# Launch a noVNC popupto another host
+    $('#connect').click(function(){
+      window.open("<%== $novnc_url %>" + $('#choose').val());
+      $('#choose').val('')
+    });
+    %# Enter on #choose will simulate a click on #connect
+    $('#choose').keypress(function (e) {
+      if (e.which == 13) {
+        $('#connect').trigger('click');
+        return false;
+      }
+    });
+    %# Fetch and update the dom0s on backfground via websocket
     $('#fetch').click(function(){
       if (!("WebSocket" in window)) {
         alert('Your browser does not support WebSockets!');
@@ -262,11 +294,6 @@ __DATA__
         var data = JSON.parse(e.data);
         alert(e.data);
       }
-    });
-    $('#vnc').focus();
-    $('#choose').val('');
-    $('#connect').click(function(){
-      window.open("<%== $novnc_url %>" + $('#choose').val());
     });
   %= end
 </body>
